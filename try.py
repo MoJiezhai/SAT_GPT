@@ -10,6 +10,11 @@ from torch.utils.data.distributed import DistributedSampler
 import argparse
 import os
 
+from SATmain.models import GraphTransformer
+import torch_geometric.utils as utils
+from prop import build_corrected_lattice
+from model import Transformer
+
 def lattice_volume_non_ortho(prop):
     """
     prop: (6,) tensor -> [a, b, c, alpha, beta, gamma]
@@ -32,92 +37,7 @@ def lattice_volume_non_ortho(prop):
 
     return volume
 
-def autoreg_loss(
-    coord_preds, prop_preds,
-    Zs, coords, prop, lengths, 
-    rms_threshold=0.1, prop_weight=0.1
-):
-    """
-    Coordinate autoregressive loss:
-    - Z is condition only
-    - coords[t] is predicted at position t
-    - causality enforced by attention mask in forward
-    """
-
-    B, L, _ = coord_preds.shape
-    device = coord_preds.device
-
-    # -----------------------------
-    # valid mask based on lengths
-    # -----------------------------
-    valid_mask = torch.zeros((B, L), dtype=torch.bool, device=device)
-    for i in range(B):
-        Li = lengths[i].item()
-        valid_mask[i, :Li] = 1
-
-    valid_flat = valid_mask.reshape(-1).float()
-
-    # -----------------------------
-    # coordinate MSE loss
-    # -----------------------------
-    pred_flat = coord_preds.reshape(-1, 3)
-    tgt_flat  = coords.reshape(-1, 3)
-
-    # 数值安全处理，防止 NaN
-    pred_flat = torch.nan_to_num(pred_flat, nan=0.0, posinf=0.0, neginf=0.0)
-    tgt_flat  = torch.nan_to_num(tgt_flat, nan=0.0, posinf=0.0, neginf=0.0)
-
-    loss_coord_all = (pred_flat - tgt_flat).pow(2).sum(dim=-1)
-    loss_coord = (loss_coord_all * valid_flat).sum() / valid_flat.sum().clamp(min=1.0)
-
-    # -----------------------------
-    # property regression loss
-    # -----------------------------
-    eps = 1e-6
-    # 对长度类属性用 softplus 保证非负
-    pred_len = F.softplus(prop_preds[:, :3])
-    true_len = prop[:, :3].clamp(min=eps)
-
-    loss_len = (torch.log(pred_len + eps) - torch.log(true_len + eps)).pow(2).mean()
-    loss_ang = (prop_preds[:, 3:] - prop[:, 3:]).pow(2).mean()
-    loss_prop = loss_len + loss_ang
-
-    # -----------------------------
-    # structure-level RMS accuracy
-    # -----------------------------
-    rms_losses = []
-    correct = 0
-    total = 0
-
-    for i in range(B):
-        Li = lengths[i].item()
-
-        coord_gt = coords[i, :Li]
-        coord_pr = coord_preds[i, :Li]
-
-        if coord_gt.shape[0] <= 1:
-            continue
-
-        N = coord_gt.shape[0]
-        V = lattice_volume_non_ortho(prop[i])
-        V = torch.clamp(V, min=1e-6)  # 防止负体积导致 NaN
-        norm = (V / N).pow(1.0 / 3.0)
-
-        rms = torch.sqrt((coord_pr - coord_gt).pow(2).sum(dim=-1).mean()) / norm
-        rms_losses.append(rms)
-
-        with torch.no_grad():
-            correct += (rms < rms_threshold).float().item()
-            total += 1
-
-    rms_loss = torch.stack(rms_losses).mean() if rms_losses else torch.tensor(0.0, device=device)
-    accuracy = correct / max(total, 1)
-
-    return loss_coord * 0.1 + rms_loss, loss_prop * prop_weight, loss_coord, accuracy
-
-
-
-
+from loss import autoreg_loss, frac_to_cart,  prop_preds_to_lattice_matrix, lattice6_to_matrix
 # -----------------------
 # Autoregressive generation
 # -----------------------
@@ -161,9 +81,52 @@ def toy_example(satopt, train_loader, val_loader, test_loader, ckpt_path=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log_file = open("try_log.txt", "w")
     
+    prop_model = Transformer(num_cond=satopt["model"]["k_dim"],max_atoms=satopt["model"]["max_length"])
+    prop_model.to(device)
+    #print(torch.isnan(prop_model.element_embed.weight).any())
+    prop_optimizer = torch.optim.AdamW(prop_model.parameters(), lr=satopt["training"]["optamizer"]["lr"], weight_decay=1e-5)
+    prop_lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(prop_optimizer, mode='min',
+                                                            factor=0.5,
+                                                            patience=15,
+                                                            min_lr=1e-05,
+                                                            verbose=False)
+    
     # model
-    model = SATGPT(num_atom_types=satopt["model"]["num_atom_types"], y_dim=satopt["model"]["y_dim"], d_model=satopt["model"]["d_model"], n_layer=satopt["model"]["n_layer"], n_head=satopt["model"]["n_head"], d_head=satopt["model"]["d_head"], d_ff=satopt["model"]["d_ff"], coord_emb_dim=satopt["model"]["coord_emb_dim"], max_length=satopt["model"]["max_length"])
+    model = SATGPT(num_atom_types=satopt["model"]["num_atom_types"], k_dim=satopt["model"]["k_dim"], d_model=satopt["model"]["d_model"], n_layer=satopt["model"]["n_layer"], n_head=satopt["model"]["n_head"], d_head=satopt["model"]["d_head"], d_ff=satopt["model"]["d_ff"], coord_emb_dim=satopt["model"]["coord_emb_dim"], max_length=satopt["model"]["max_length"])
     model.to(device)
+    
+    '''prop_deg = torch.cat([
+    utils.degree(data.edge_index[1], num_nodes=data.num_nodes)
+    for data in train_dset])
+     prop_model = GraphTransformer(in_size=satopt["model"]["num_atom_types"],
+    #                          num_class=9,
+    #                          d_model=64,
+    #                          dim_feedforward=2*64,
+    #                          dropout=0.2,
+    #                          num_heads=8,
+    #                          num_layers=6,
+    #                          batch_norm=False,
+    #                          abs_pe='rw',
+    #                          abs_pe_dim=20,
+    #                          gnn_type='pna2',
+    #                          use_edge_attr='store_true',
+    #                          num_edge_features=10000,
+    #                          edge_dim=32,
+    #                          k_hop=2,
+    #                          se="gnn",
+    #                          deg=prop_deg,
+    #                          global_pool='mean'
+    #                          ) 
+    # prop_model.to(device)
+    # prop_criterion = nn.L1Loss()
+    # prop_optimizer = torch.optim.AdamW(model.parameters(), lr=1, weight_decay=1e-5)
+    # prop_lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(prop_optimizer, mode='min',
+    #                                                         factor=0.5,
+    #                                                         patience=15,
+    #                                                         min_lr=1e-05,
+    #                                                         verbose=False)
+    # prop_best_val_loss = float('inf')'''
+    
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=satopt["training"]["optamizer"]["lr"],
@@ -189,7 +152,12 @@ def toy_example(satopt, train_loader, val_loader, test_loader, ckpt_path=None):
         traj_path=None,
         batch_size=None,
         log_file=None,
-        best_val=0
+        best_val=0,
+        # prop_model = prop_model,
+        # prop_criterion = prop_criterion,
+        # prop_optimizer = prop_optimizer,
+        # prop_lr_scheduler = prop_lr_scheduler,
+        # prop_best_val_loss = prop_best_val_loss,
     ):
         start_time = timer()
         assert phase in ["train", "val", "test"]
@@ -200,14 +168,13 @@ def toy_example(satopt, train_loader, val_loader, test_loader, ckpt_path=None):
             model.train()
         else:
             model.eval()
-
-        with torch.no_grad():
-            total_loss = 0.0
-            total_type = 0.0
-            total_coord = 0.0
-            total_prop = 0.0
-            total_rms = 0.0
-            total_acc = 0.0
+            
+        total_loss = 0.0
+        total_type = 0.0
+        total_coord = 0.0
+        total_prop = 0.0
+        total_rms = 0.0
+        total_acc = 0.0
 
         step = 0
 
@@ -215,60 +182,106 @@ def toy_example(satopt, train_loader, val_loader, test_loader, ckpt_path=None):
         with context:
             for batch in dataloader:
                 Z = batch['Z'].to(device)
-                coords = batch['coords'].to(device)
+                coords_frac  = batch['coords'].to(device)
                 lengths = batch['lengths'].to(device)
                 prop = batch['prop'].to(device)
-
-                if phase == "train":
-                    coord_preds, prop_preds = model(
-                        Z,
-                        coords,
-                        lengths,
-                        prop,
-                        None,
-                        batch['sub_nodes'].to(device),
-                        batch['sub_indicator'].to(device),
-                        batch['sub_batch_index'].to(device),
-                        False
-                    )
-                else:
-                    coord_preds = model.sample(Z, cond=None)
-                    _, prop_preds = model(
-                        Z,
-                        coord_preds,
-                        lengths,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        False
-                    )  # 或者用生成结构再算
-
-                loss_coord, loss_prop, rms_loss, accuracy = autoreg_loss(
-                    coord_preds,
-                    prop_preds,
-                    Z,
-                    coords,
-                    prop,
-                    lengths
-                )
+                cond = batch['cond'].to(device)
+                #print(lengths)
                 
+                # cond = coords_frac.view(coords_frac.size(0), -1)
+                # _, current_dim = cond.shape  # 计算非batch维度的总元素数
+                # if current_dim < satopt["model"]["k_dim"]:
+                #     # 计算需要补齐的0的个数
+                #     pad_size = satopt["model"]["k_dim"] - current_dim
+                #     # 先展平非batch维度
+                #     #print(new)
+                #     # 在后面补0 (pad的格式: (左, 右) 对最后一维)
+                #     cond = F.pad(cond, (0, pad_size), mode='constant', value=-1)
+                #print(cond)
+                
+
+                #cond[:, 3:] = (cond[:, 3:] - 60) / 6
+                #prop[:, 3:] = (prop[:, 3:] - 60) / 6
+
+                if phase == "train":   
+                    #print("element_embed weight:", torch.isnan(prop_model.element_embed.weight).any())
+                    #print("global_token:", torch.isnan(prop_model.global_token).any())
+                    prop_preds = prop_model(Z=Z, cond=cond, lengths=lengths)  
+                    #print(Z)               
+                    coord_preds = model(
+                        Zs=Z, #coords=coords_frac, 
+                        lengths=lengths, 
+                        lattice=prop,
+                        cond=cond,
+                        subgraph_node_index=batch['sub_nodes'].to(device), 
+                        subgraph_indicator=batch['sub_indicator'].to(device),
+                        sub_batch_index=batch['sub_batch_index'].to(device),
+                        #sat=False,
+                        teacher_forcing= False,
+                        noise_std=0.05*epoch
+                    )
+                    
+
+                elif phase == "val":
+                    prop_preds = prop_model(Z=Z, cond=cond, lengths=lengths)  
+                    coord_preds = model(Zs=Z, 
+                                        #coords=coords_frac, 
+                                        lengths=lengths, 
+                        lattice=prop_preds,
+                        cond=cond,
+                        #sat=False,
+                        )#model.sample(Z, cond)  
+                    
+                else:
+                    prop_preds = prop_model(Z=Z, cond=cond, lengths=lengths) 
+                    coord_preds = model.sample(Zs=Z, lattice=prop_preds, 
+                                               cond=cond)
+                
+                #if random.random()<0.01:print(coords_frac, coord_preds)  
+                
+                #print(coords_frac, coord_preds)
+                # 
+                # coord_preds = torch.linalg.solve(
+                #     L,
+                #     coord_preds.transpose(1,2)
+                # ).transpose(1,2)
+
+                #prop_preds = prop
+                loss_coord, loss_prop, rms_loss, accuracy = autoreg_loss(
+                        coord_preds,
+                        prop_preds,
+                        Z,
+                        coords_frac,
+                        prop,
+                        lengths
+                    )    
 
                 loss = prop_scale * loss_prop + coord_scale * loss_coord 
 
                 if is_train:
                     #c = timer()
                     optimizer.zero_grad()
+                    prop_optimizer.zero_grad()
                     loss.backward()
+                    
+                    # total_norm = 0.0
+                    # count = 0
+                    # for p in model.parameters():
+                    #     if p.grad is not None:
+                    #         total_norm += p.grad.norm().item()
+                    #         count += 1
+
+                    # print("avg grad norm:", total_norm / max(count, 1))
+                    
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    torch.nn.utils.clip_grad_norm_(prop_model.parameters(), 1.0)
                     optimizer.step()
-                    #print(timer()-c)
+                    prop_optimizer.step()
 
                 with torch.no_grad():
                     total_loss += loss.item()
                     total_coord += loss_coord.item()
-                    total_prop += loss_prop.item()
+                    total_prop += loss_prop
                     total_rms += rms_loss.item()
                     total_acc += accuracy
 
@@ -276,15 +289,18 @@ def toy_example(satopt, train_loader, val_loader, test_loader, ckpt_path=None):
                 if save_traj:
                     from match import preds_to_traj
                     traj_path_step = traj_path+f"{step:03d}.traj"
+                    L = lattice6_to_matrix(prop_preds)
+                    #print(prop_preds, L)
+                    #print(L)
                     preds_to_traj(
                         type_logits=batch['Z'].to(device),
                         coord_preds=coord_preds,
                         lengths=batch['lengths'].to(device),
                         traj_path=traj_path_step,
-                        cell_params=prop_preds,
+                        cell_params=L,
                         ignore_index_list=batch['score']
                     )
-                    step += 1
+                step += 1
 
         if scheduler is not None and is_train:
             scheduler.step()
@@ -308,7 +324,7 @@ def toy_example(satopt, train_loader, val_loader, test_loader, ckpt_path=None):
             f"Type {avg_type:.4f} | "
             f"Coord+Rms {avg_coord:.4f} | "
             f"Prop {avg_prop:.4f} | "
-            f"Coord {avg_rms:.4f} | "
+            f"Rms {avg_rms:.4f} | "
             f"Acc {avg_acc:.4f} | "
             f"Time {time:.4f}"
         )
@@ -321,6 +337,8 @@ def toy_example(satopt, train_loader, val_loader, test_loader, ckpt_path=None):
         if phase == 'val' and avg_loss < best_val :
             best_val = avg_loss
             torch.save(model.state_dict(), "best.pt")
+            torch.save(prop_model.state_dict(), "best_prop.pt")
+            #torch.save(prop_model.state_dict(), "best_prop.pt")
             print("Saved best model.")
             log_file.write("Saved best model.\n")
         return best_val
@@ -354,10 +372,15 @@ def toy_example(satopt, train_loader, val_loader, test_loader, ckpt_path=None):
             epoch,
             phase="train",
             coord_scale=coord_scale,
-            prop_scale=prop_scale,
+            prop_scale=prop_scale,#*epoch/satopt["training"]["epoch"],#*epoch/satopt["training"]["epoch"],
             optimizer=optimizer,
             scheduler=scheduler,
-            log_file=log_file
+            log_file=log_file,
+            batch_size=batch_size,
+            # prop_model = prop_model,
+            # prop_criterion = prop_criterion,
+            # prop_optimizer = prop_optimizer,
+            # prop_lr_scheduler = prop_lr_scheduler
         )
         # -------- VAL --------
         best_val = run_epoch(
@@ -369,12 +392,15 @@ def toy_example(satopt, train_loader, val_loader, test_loader, ckpt_path=None):
             coord_scale=coord_scale,
             prop_scale=prop_scale,
             save_traj=False,
-            traj_path="SAT_data/gen/val_gen",
+            traj_path="SAT_data/gen/gen",
             batch_size=batch_size,
             log_file=log_file,
-            best_val=best_val
+            best_val=best_val,
+            # prop_model = prop_model,
+            # prop_best_val_loss = prop_best_val_loss,
+            # prop_criterion = prop_criterion,
         )
-        print(best_val)
+        
 
     # generation demo
     model.load_state_dict(torch.load("best.pt"))
@@ -388,9 +414,12 @@ def toy_example(satopt, train_loader, val_loader, test_loader, ckpt_path=None):
         phase="test",
         coord_scale=coord_scale,
         prop_scale=prop_scale,
+        batch_size=batch_size,
         save_traj=True,
         traj_path="SAT_data/gen/gen",
-        log_file=log_file
+        log_file=log_file,
+        # prop_model = prop_model,
+        # prop_criterion = prop_criterion,
     )
 
     log_file.close()
@@ -412,9 +441,9 @@ if __name__ == "__main__":
     train_path = args.train_json
     val_path = args.val_json
     test_path = args.test_json
-    train_ds = CrystalStructureDataset(train_path, randomchose=True,dim=2, scale=0.001)
-    val_ds   = CrystalStructureDataset(val_path,   randomchose=False,dim=2, scale=0.001)
-    test_ds   = CrystalStructureDataset(test_path,   randomchose=False,dim=2, scale=0.001)
+    train_ds = CrystalStructureDataset(train_path, randomchose=True,dim=2, scale=1)
+    val_ds   = CrystalStructureDataset(val_path,   randomchose=False,dim=2, scale=1)
+    test_ds   = CrystalStructureDataset(test_path,   randomchose=False,dim=2, scale=1)
     import random
     seed = args.seed
     random.seed(seed)
@@ -424,10 +453,18 @@ if __name__ == "__main__":
     
     from match import dataset_to_traj
     dataset_to_traj(
+    train_ds,
+    traj_filename="SAT_data/target/train.traj"
+    )
+    dataset_to_traj(
+    val_ds,
+    traj_filename="SAT_data/target/val.traj"
+    )
+    dataset_to_traj(
     test_ds,
     traj_filename="SAT_data/target/target.traj"
     )
-    print('生成完成')
+    # print('生成完成')
     
     # 完整周期表：符号 → 原子序数
     
@@ -437,44 +474,48 @@ if __name__ == "__main__":
     
     batch_size=args.batch_size
     train_loader = DataLoader(
-        SATDataLoader(train_dataset, cutoff=0.5, k_hop=1),
+        SATDataLoader(train_dataset, cutoff=0.1, k_hop=1),
         batch_size=batch_size,
         shuffle=True,
         num_workers=0,
         collate_fn=collate_fn
     )
     val_loader = DataLoader(
-        SATDataLoader(val_dataset, cutoff=0.5, k_hop=1),
-        batch_size=4,
+        SATDataLoader(val_dataset, cutoff=0.1, k_hop=1),
+        batch_size=batch_size,
         shuffle=True,
         num_workers=0,
         collate_fn=collate_fn
     )
     test_loader = DataLoader(
-        SATDataLoader(test_dataset, cutoff=0.5, k_hop=1),
-        batch_size=4,
+        SATDataLoader(test_dataset, cutoff=0.1, k_hop=1),
+        batch_size=batch_size,
         shuffle=False,
         num_workers=0,
         collate_fn=collate_fn
     )
     
+    from prop import convert_train_dataset
+    train_dset = convert_train_dataset(train_dataset)
+    
     satopt = {
         "model": {
             "num_atom_types":atom_types,
-            "y_dim":6, 
-            "d_model":128, 
-            "n_layer":4, 
-            "n_head":4, 
-            "d_head":32,
-            "d_ff":512, 
-            "coord_emb_dim":256, 
-            "max_length":32
+            #"y_dim":6, 
+            "k_dim":3,
+            "d_model":1024, 
+            "n_layer":16, 
+            "n_head":12, 
+            "d_head":64,
+            "d_ff":1024, 
+            "coord_emb_dim":512, 
+            "max_length":50
         },
         "training": {
             "epoch": args.epochs,
             "optamizer": {
                 "lr": 1e-5,
-                "weight_decay": 0.0
+                "weight_decay": 0.01
             }
         }
     }

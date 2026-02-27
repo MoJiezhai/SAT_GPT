@@ -29,6 +29,25 @@ element_map = {
         "Nh": 113, "Fl": 114, "Mc": 115, "Lv": 116, "Ts": 117, "Og": 118
     }
 
+def lattice_matrix(a, b, c, alpha, beta, gamma):
+                alpha = np.radians(alpha)
+                beta  = np.radians(beta)
+                gamma = np.radians(gamma)
+
+                A = np.zeros((3,3))
+                A[0,0] = a
+                A[0,1] = b * np.cos(gamma)
+                A[0,2] = c * np.cos(beta)
+
+                A[1,1] = b * np.sin(gamma)
+                A[1,2] = c * (np.cos(alpha) - np.cos(beta)*np.cos(gamma)) / np.sin(gamma)
+
+                A[2,2] = c * np.sqrt(
+                    1
+                    - np.cos(beta)**2
+                    - ((np.cos(alpha) - np.cos(beta)*np.cos(gamma)) / np.sin(gamma))**2
+                )
+                return A
 # dataset defined for 
 class CrystalStructureDataset(Dataset):
     def __init__(self, json_file, randomchose=True, dim=2, scale=1):
@@ -52,7 +71,7 @@ class CrystalStructureDataset(Dataset):
     def __getitem__(self, idx):
         # 随机从每一行中选择一个对象
         row = self.data[idx]
-        variants = row#["variants"] 此处是值得修改的内容，对于不同的数据包往往在此报错
+        variants = row#["variants"] #此处是值得修改的内容，对于不同的数据包往往在此报错
 
         if self.random and self.dim == 2:
             sampled_object = random.choice(variants)  # 随机从当前行的多个对象中选择一个
@@ -68,25 +87,6 @@ class CrystalStructureDataset(Dataset):
             crystPrompt = []
             atom_idx = 0
             # ------------- (A) 构造晶胞矩阵 -----------------
-            def lattice_matrix(a, b, c, alpha, beta, gamma):
-                alpha = np.radians(alpha)
-                beta  = np.radians(beta)
-                gamma = np.radians(gamma)
-
-                A = np.zeros((3,3))
-                A[0,0] = a
-                A[0,1] = b * np.cos(gamma)
-                A[0,2] = c * np.cos(beta)
-
-                A[1,1] = b * np.sin(gamma)
-                A[1,2] = c * (np.cos(alpha) - np.cos(beta)*np.cos(gamma)) / np.sin(gamma)
-
-                A[2,2] = c * np.sqrt(
-                    1
-                    - np.cos(beta)**2
-                    - ((np.cos(alpha) - np.cos(beta)*np.cos(gamma)) / np.sin(gamma))**2
-                )
-                return A
 
             def frac2cart(frac, A):
                 return A @ frac
@@ -114,7 +114,7 @@ class CrystalStructureDataset(Dataset):
                 frac = np.array([fx, fy, fz], dtype=float)
                 cart = frac2cart(frac, A)  # 转换为绝对坐标
 
-                cx, cy, cz = cart.tolist()
+                cx, cy, cz = frac.tolist()
 
                 # ---------------------------------------------------
                 # (C) 存入 seq_Ele（保持原结构，但用绝对坐标）
@@ -164,39 +164,58 @@ class CrystalStructureDataset(Dataset):
         return preprocess_object(sampled_object)
 
 def parse_atoms(data_item):
-            """从你的 crystal_json 里顺序提取元素和坐标，返回 Z_list 与 coord_list"""
-            cj = data_item["crystal_json"]
+    """
+    从 'cryst_seq_ele' 提取：
+    - Z_list: List[int]，原子序数
+    - coord_list: List[List[float]]，Cartesian 坐标
+    - cellpar: [a, b, c, alpha, beta, gamma]
+    """
+    seq_Ele = data_item["cryst_seq_ele"]  # 已经是 Cartesian
 
-            # num_atom 形如 ['8']，需要转 int
-            num_atom = int(data_item["num_atom"][0])
+    Z_list = []
+    coord_list = []
 
-            Z_list = []
-            coord_list = []
+    # seq_Ele 结构: ["<atom>", "Ele0", "C", "x0", x, "y0", y, "z0", z, "<atom>", ...]
+    i = 0
+    while i < len(seq_Ele):
+        if seq_Ele[i] == "<atom>":
+            ele_symbol = seq_Ele[i+2]
+            Z_list.append(element_map[ele_symbol])
 
-            for i in range(num_atom):
-                # ------- 元素 -------
-                ele = cj[f"Ele{i}"]   # 如 'C'
-                if ele not in element_map:
-                    raise ValueError(f"未知元素 '{ele}'，请在 element_map 中添加映射。")
-                Z_list.append(element_map[ele])
+            # Cartesian 坐标
+            x = float(seq_Ele[i+4])
+            y = float(seq_Ele[i+6])
+            z = float(seq_Ele[i+8])
+            coord_list.append([x, y, z])
 
-                # ------- 坐标 -------
-                x = cj[f"x{i}"]
-                y = cj[f"y{i}"]
-                z = cj[f"z{i}"]
+            i += 9  # 跳到下一个原子
+        else:
+            i += 1
 
-                coord_list.append([x, y, z])
-            
-            cellpar = [
-                float(cj['a']),
-                float(cj['b']),
-                float(cj['c']),
-                float(cj['alpha']),
-                float(cj['beta']),
-                float(cj['gamma']),
-            ]
+    # 晶格参数仍然从 crystal_json 里读（没有变化）
+    cj = data_item["crystal_json"]
+    cellpar = [
+        float(cj["a"]),
+        float(cj["b"]),
+        float(cj["c"]),
+        float(cj["alpha"]),
+        float(cj["beta"]),
+        float(cj["gamma"]),
+    ]
+    cond = [
+        float(cj.get("formation_energy", 0.0)),
+        float(cj.get("energy_above_hull", 0.0)),
+        float(cj.get("spacegroup_number", 0.0)),
+        # float(cj["a"]),
+        # float(cj["b"]),
+        # float(cj["c"]),
+        # float(cj["alpha"]),
+        # float(cj["beta"]),
+        # float(cj["gamma"]),
+    ]
 
-            return Z_list, coord_list, cellpar
+    return Z_list, coord_list, cellpar, cond
+
 
 # -----------------------
 # Simple dataset skeleton
@@ -220,11 +239,14 @@ class SequenceStructureDataset(Dataset):
     def __getitem__(self, idx):
         data = self.examples[idx]
         # 直接解析
-        Z, coords, cellpar = parse_atoms(data)
+        #print(data)
+        Z, coords, cellpar, cond = parse_atoms(data)
+        #cellpar = lattice_matrix(cellpar[0],cellpar[1],cellpar[2],cellpar[3],cellpar[4],cellpar[5])
 
         Z = torch.tensor(Z, dtype=torch.long)          # [L]
         coords = torch.tensor(coords, dtype=torch.float32)  # [L, 3]
-        cellpar = torch.tensor(cellpar, dtype=torch.float32)
+        cellpar = torch.tensor(cellpar, dtype=torch.float32).view(-1)
+        cond = torch.tensor(cond, dtype=torch.float32)
 
         L = Z.shape[0]
 
@@ -238,10 +260,12 @@ class SequenceStructureDataset(Dataset):
             'Z': Z,
             'coords': coords,
             'L': L,
+            'cond': cond,
             'score': 0,
             'num': L,
             'prop': cellpar,
             'par': len(cellpar),
+            'condnum': len(cond)
         }
 
 # def collate_batch(batch):
@@ -320,11 +344,13 @@ class SATDataLoader(Dataset):
     def __getitem__(self, idx):
         data = self.data_list[idx]
 
-        Z = data["Z"].clone().detach().long()        # (L,)
-        coords = data["coords"].clone().detach().float()
-        P = data["prop"].clone().detach().float()
+        Z = data["Z"].clone().long()        # (L,)
+        coords = data["coords"].clone().float()
+        P = data["prop"].clone().float()
         par = data['par']
         Y = data["score"]
+        cond = data["cond"]
+        condnum = data["condnum"]
         length = torch.tensor(len(Z), dtype=torch.long)
         num = data["num"]
 
@@ -344,6 +370,8 @@ class SATDataLoader(Dataset):
             "coords": coords,
             "length": length,
             'score': Y,
+            'cond': cond,
+            'condnum': condnum,
             'num': num,
             'prop': P,
             'par': par,
@@ -355,11 +383,13 @@ def collate_fn(batch):
     # === Step 1 — padding 主序列（给 Transformer 用） =======================
     Z_list = [item["Z"] for item in batch]
     coords_list = [item["coords"] for item in batch]
+    cond_list = [item["cond"] for item in batch]
     P_list = [item["prop"] for item in batch]
     lengths = torch.tensor([len(z) for z in Z_list], dtype=torch.long)
     num = [item["num"] for item in batch]
     score = [item["score"] for item in batch]
     par = [item["par"] for item in batch]
+    condnum = [item["condnum"] for item in batch]
 
     B = len(batch)
     L_max = max(lengths)
@@ -368,12 +398,14 @@ def collate_fn(batch):
     Zs = torch.zeros(B, L_max, dtype=torch.long)
     coords = torch.zeros(B, L_max, 3, dtype=torch.float)
     Prop = torch.zeros(B, par[0], dtype=torch.float)
+    Cond = torch.zeros(B, condnum[0], dtype=torch.float)
 
-    for i, (Z, C, P) in enumerate(zip(Z_list, coords_list, P_list)):
+    for i, (Z, C, P, Co) in enumerate(zip(Z_list, coords_list, P_list, cond_list)):
         L = len(Z)
         Zs[i, :L] = Z
         coords[i, :L] = C
         Prop[i, :par[0]] = P
+        Cond[i, :condnum[0]] = Co
 
     # === Step 2 — subgraph（保持 PyG graph batching 格式） ===================
     sub_nodes_list = []
@@ -406,9 +438,11 @@ def collate_fn(batch):
         "coords": coords,                  # (B, L_max, 3)
         "lengths": lengths,                # (B,)
         "score": score,
+        "cond": Cond,
         "num": num,
         'prop': Prop,
         'par': par,
+        'condnum': condnum,
         "sub_nodes": sub_nodes,            # (sum sub_nodes,)
         "sub_indicator": sub_indicator,    # (sum sub_nodes,)
         "sub_batch_index": sub_batch_index # (sum sub_nodes,)
